@@ -1,177 +1,173 @@
-#include "hit.h";
-#include "idle.h";
-#include "off.h";
-#include "on.h";
-#include "swing.h";
-#include "XT_DAC_Audio.h";
-#include<Wire.h>
-#include<QMC5883.h>
+#include "hit.h"
+#include "idle_hq.h"
+#include "on.h"
+#include "off.h"
+#include "swing.h"
+#include <XT_DAC_Audio.h>
+#include <Wire.h>
+#include <QMC5883.h>
 #include <FastLED.h>
+#include <Filter.h>
 
-#define HIT_THRESHOLD 8200000
-#define SWING_THRESHOLD 8200000
+#define HIT_THRESHOLD 4000
+#define SWING_THRESHOLD 1000
 
-XT_Wav_Class hit(hit_new_wav);        // create an object of type XT_Wav_Class that is used by 
-XT_Wav_Class idle(idle_new_wav);      // the dac audio class (below), passing wav data as parameter.
-XT_Wav_Class off(off_new_wav);
+XT_Wav_Class hit(hit_new_wav);
+XT_Wav_Class idle(idle_wav);
 XT_Wav_Class on(on_new_wav);
-XT_Wav_Class swing(swing_new_wav);    
-                                  
-// Create the main player class object. Use GPIO 25, one of the 2 DAC pins and timer 0
-XT_DAC_Audio_Class DacAudio(25,0);    
+XT_Wav_Class off(off_new_wav);
+XT_Wav_Class swing(swing_new_wav);
 
-QMC5883 qq;
-int x, z;
-unsigned long force;
+XT_DAC_Audio_Class DacAudio(25,0);
+XT_Sequence_Class Sequence; 
+
+QMC5883 sensor;
+int x, y, z;
+unsigned long reading = 0, f_reading = 0, old_f_reading = 0;
+uint8_t d_counter = 0;
+int d_reading = 0;
+bool actionable = false;
+
+ExponentialFilter<unsigned long> reading_filter(5, 0);
 
 #define LED_PIN     5
 #define NUM_LEDS    40
-#define BRIGHTNESS  64
+#define BRIGHTNESS  180
 #define LED_TYPE    WS2811
 #define COLOR_ORDER GRB
 CRGB leds[NUM_LEDS];
-#define UPDATES_PER_SECOND 100
-CRGBPalette16 currentPalette;
-TBlendType    currentBlending;
-extern CRGBPalette16 myRedWhiteBluePalette;
-extern const TProgmemPalette16 myRedWhiteBluePalette_p PROGMEM;
 
 void setup() {
   Serial.begin(115200);
-  qq.begin();
-  delay( 3000 ); // power-up safety delay
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection( TypicalLEDStrip );
-  FastLED.setBrightness(  BRIGHTNESS );
-  DacAudio.PlayWav(&on);    
-  currentPalette = RainbowColors_p;
-  currentBlending = LINEARBLEND;  
-}
 
-void loop() {
-//  if(idle.Completed)
-    
-  delay(100);
-  qq.calculate(); // separate thread
-  x = qq.getX()>>5;
-  z = qq.getZ()>>5;
-  force = x*x + z*z;
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+  FastLED.setBrightness(BRIGHTNESS);
+  mineSaberOn();
   
-  Serial.println(force);
+  sensor.begin();
+}
 
-  if(force > HIT_THRESHOLD)
-    DacAudio.PlayWav(&hit);
-  if(force > SWING_THRESHOLD)
-    DacAudio.PlayWav(&swing);    
+bool first = true;
+void loop() {
+  sensor.calculate();
+  x = sensor.getX()>>9;
+  y = sensor.getY()>>9;
+  z = sensor.getZ()>>9;
+  reading = x*x + y*y + z*z;
+  if(first) {
+    reading_filter.SetCurrent(reading);
+    old_f_reading = reading;
+    first = false;
+  }
+  else
+    reading_filter.Filter(reading);
+  f_reading = reading_filter.Current();
+  Serial.print(reading);
+  Serial.print("  ---   ");
+  Serial.print(f_reading);
+  Serial.print("  ---   ");
+  Serial.println(d_reading);
+  
+  if(++d_counter>10) {
+    actionable = true;
+    d_reading = abs(f_reading - old_f_reading);
+    old_f_reading = f_reading;
+    d_counter = 0;
+  }
+  if((d_reading > HIT_THRESHOLD) && actionable) {
+    mineSaberHit();
+    actionable = false;
+    reading_filter.SetCurrent(reading);
+  }
+  else if((d_reading > SWING_THRESHOLD) && actionable) {
+    mineSaberSwing();
+    actionable = false;    
+    reading_filter.SetCurrent(reading);
+  }
+  else
+    mineSaberIdle();
 
-  ChangePalettePeriodically();  
-  static uint8_t startIndex = 0;
-  startIndex = startIndex + 1; /* motion speed */
-  FillLEDsFromPaletteColors( startIndex);
+  DacAudio.FillBuffer();  
+    
+  delay(50);
+}
+
+void mineSaberOn() {
+  Sequence.RemoveAllPlayItems();  
+  Sequence.AddPlayItem(&on);
+  DacAudio.Play(&Sequence);
+  unsigned long t = millis();
+  int led = 0;
+  while(Sequence.Playing) {
+    if((led < NUM_LEDS) && ((millis()-t) > 10)){
+      t = millis();
+      leds[led] = CRGB::MidnightBlue;
+      led++;
+      FastLED.show();
+    }
+    // Show the leds (only one of which is set to white, from above)
+    DacAudio.FillBuffer();  
+  }
+}
+
+void mineSaberOff() {
+  Sequence.RemoveAllPlayItems();  
+  Sequence.AddPlayItem(&off);
+  DacAudio.Play(&Sequence);
+  unsigned long t = millis();
+  int led = NUM_LEDS-1;
+  while(Sequence.Playing) {
+    if((led >= 0) && ((millis()-t) > 10)){
+      t = millis();
+      leds[led] = CRGB::Black;
+      led--;
+      FastLED.show();
+    }
+    // Show the leds (only one of which is set to white, from above)
+    DacAudio.FillBuffer();  
+  }
+}
+
+void mineSaberSwing() {
+  Sequence.RemoveAllPlayItems();  
+  Sequence.AddPlayItem(&swing);
+  DacAudio.Play(&Sequence);
+  unsigned long t = millis();
+  int led = 0;
+  while(Sequence.Playing) {
+    if((led < NUM_LEDS)){
+      t = millis();
+      leds[led] = CRGB::Blue;
+      led++;
+      FastLED.show();
+    }
+    // Show the leds (only one of which is set to white, from above)
+    DacAudio.FillBuffer();  
+  }
+}
+
+void mineSaberHit() {
+  Sequence.RemoveAllPlayItems();  
+  Sequence.AddPlayItem(&hit);
+  DacAudio.Play(&Sequence);
+  unsigned long t = millis();
+  int i = 0;
+  FastLED.setBrightness(BRIGHTNESS);
+  while(Sequence.Playing) {
+    if(i++%20)
+      fill_solid( leds, NUM_LEDS, CRGB::Cyan);
+    else
+      fill_solid( leds, NUM_LEDS, CRGB::Blue);
+    FastLED.show();
+    // Show the leds (only one of which is set to white, from above)
+    DacAudio.FillBuffer();  
+  }
+}
+
+void mineSaberIdle() {
+  Sequence.RemoveAllPlayItems();    
+  Sequence.AddPlayItem(&idle);
+  DacAudio.Play(&Sequence);
+  fill_solid( leds, NUM_LEDS, CRGB::MidnightBlue);
   FastLED.show();
-  FastLED.delay(1000 / UPDATES_PER_SECOND);    
 }
-
-void FillLEDsFromPaletteColors( uint8_t colorIndex)
-{
-    uint8_t brightness = 255;
-    
-    for( int i = 0; i < NUM_LEDS; i++) {
-        leds[i] = ColorFromPalette( currentPalette, colorIndex, brightness, currentBlending);
-        colorIndex += 3;
-    }
-}
-
-
-// There are several different palettes of colors demonstrated here.
-//
-// FastLED provides several 'preset' palettes: RainbowColors_p, RainbowStripeColors_p,
-// OceanColors_p, CloudColors_p, LavaColors_p, ForestColors_p, and PartyColors_p.
-//
-// Additionally, you can manually define your own color palettes, or you can write
-// code that creates color palettes on the fly.  All are shown here.
-
-void ChangePalettePeriodically()
-{
-    uint8_t secondHand = (millis() / 1000) % 60;
-    static uint8_t lastSecond = 99;
-    
-    if( lastSecond != secondHand) {
-        lastSecond = secondHand;
-        if( secondHand ==  0)  { currentPalette = RainbowColors_p;         currentBlending = LINEARBLEND; }
-        if( secondHand == 10)  { currentPalette = RainbowStripeColors_p;   currentBlending = NOBLEND;  }
-        if( secondHand == 15)  { currentPalette = RainbowStripeColors_p;   currentBlending = LINEARBLEND; }
-        if( secondHand == 20)  { SetupPurpleAndGreenPalette();             currentBlending = LINEARBLEND; }
-        if( secondHand == 25)  { SetupTotallyRandomPalette();              currentBlending = LINEARBLEND; }
-        if( secondHand == 30)  { SetupBlackAndWhiteStripedPalette();       currentBlending = NOBLEND; }
-        if( secondHand == 35)  { SetupBlackAndWhiteStripedPalette();       currentBlending = LINEARBLEND; }
-        if( secondHand == 40)  { currentPalette = CloudColors_p;           currentBlending = LINEARBLEND; }
-        if( secondHand == 45)  { currentPalette = PartyColors_p;           currentBlending = LINEARBLEND; }
-        if( secondHand == 50)  { currentPalette = myRedWhiteBluePalette_p; currentBlending = NOBLEND;  }
-        if( secondHand == 55)  { currentPalette = myRedWhiteBluePalette_p; currentBlending = LINEARBLEND; }
-    }
-}
-
-// This function fills the palette with totally random colors.
-void SetupTotallyRandomPalette()
-{
-    for( int i = 0; i < 16; i++) {
-        currentPalette[i] = CHSV( random8(), 255, random8());
-    }
-}
-
-// This function sets up a palette of black and white stripes,
-// using code.  Since the palette is effectively an array of
-// sixteen CRGB colors, the various fill_* functions can be used
-// to set them up.
-void SetupBlackAndWhiteStripedPalette()
-{
-    // 'black out' all 16 palette entries...
-    fill_solid( currentPalette, 16, CRGB::Black);
-    // and set every fourth one to white.
-    currentPalette[0] = CRGB::White;
-    currentPalette[4] = CRGB::White;
-    currentPalette[8] = CRGB::White;
-    currentPalette[12] = CRGB::White;
-    
-}
-
-// This function sets up a palette of purple and green stripes.
-void SetupPurpleAndGreenPalette()
-{
-    CRGB purple = CHSV( HUE_PURPLE, 255, 255);
-    CRGB green  = CHSV( HUE_GREEN, 255, 255);
-    CRGB black  = CRGB::Black;
-    
-    currentPalette = CRGBPalette16(
-                                   green,  green,  black,  black,
-                                   purple, purple, black,  black,
-                                   green,  green,  black,  black,
-                                   purple, purple, black,  black );
-}
-
-
-// This example shows how to set up a static color palette
-// which is stored in PROGMEM (flash), which is almost always more
-// plentiful than RAM.  A static PROGMEM palette like this
-// takes up 64 bytes of flash.
-const TProgmemPalette16 myRedWhiteBluePalette_p PROGMEM =
-{
-    CRGB::Red,
-    CRGB::Gray, // 'white' is too bright compared to red and blue
-    CRGB::Blue,
-    CRGB::Black,
-    
-    CRGB::Red,
-    CRGB::Gray,
-    CRGB::Blue,
-    CRGB::Black,
-    
-    CRGB::Red,
-    CRGB::Red,
-    CRGB::Gray,
-    CRGB::Gray,
-    CRGB::Blue,
-    CRGB::Blue,
-    CRGB::Black,
-    CRGB::Black
-};
